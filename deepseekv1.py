@@ -153,7 +153,7 @@ class PublicIPNATPuncher:
 
         # Socket pool oluştur
         socket_pool = []
-        for i in range(100):  # 100 socket
+        for i in raange(100):  # 100 socket
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.settimeout(0.01)
