@@ -1,52 +1,38 @@
-# Dosya Adı: smart_nat_puncher.py
-# Açıklama: NAT davranışını analiz edip öğrenen ve bu bilgiyle hedefe yönelik
-#           UDP delme işlemi yapan akıllı bir araç.
+# Dosya Adı: ultimate_nat_analyzer_fixed.py
+# Açıklama: Bir NAT'ın davranışsal imzasını; istatistiksel dağılım, zaman serisi desenleri
+#           ve yoğun entropi bölgeleri analiziyle ortaya çıkaran, profesyonel
+#           bir ağ teşhis ve görselleştirme aracı. (ValueError Düzeltmesi Eklendi)
 
 import time
 import socket
 import threading
 import random
-import struct
-import json
+import math
+from collections import Counter
 import requests
 from queue import Queue, Empty
 from tqdm import tqdm
 import numpy as np
 
-# --- GEREKLİ KÜTÜPHANELER ---
-# pip install pystun3 numpy tqdm requests
 try:
     import stun
-except ImportError:
-    print("\n[HATA] 'pystun3' kütüphanesi bulunamadı. Lütfen 'pip install pystun3' komutuyla kurun.\n")
+    import matplotlib.pyplot as plt
+    from scipy.stats import norm, mode
+except ImportError as e:
+    print(f"\n[HATA] Gerekli bir kütüphane bulunamadı: {e.name}")
+    print("Lütfen 'pip install pystun3 numpy tqdm requests matplotlib scipy' komutuyla tüm kütüphaneleri kurun.\n")
     exit()
 
 
-# -----------------------------
-
-
-class SmartNATPuncher:
-    """
-    NAT davranışını analiz edip öğrenerek hedefli delme işlemi yapan sınıf.
-    Strateji:
-    1. PROFILLE: Yüksek hızda STUN sorguları ile kendi NAT'ının port atama profilini çıkar.
-    2. ANALİZ ET: Toplanan port verisinden en olası port aralığını (min/max) belirle.
-    3. DELME İŞLEMİ YAP: Bu kesin aralığı kullanarak hedefe yönelik UDP burst saldırısı gerçekleştir.
-    """
-
-    # --- TEMEL AYARLAR ---
+class UltimateNATAnalyzer:
     CONFIG = {
-        'PROFILING_PROBES': 500,  # Profilleme için yapılacak STUN sorgusu sayısı
-        'PROFILING_WORKERS': 150,  # Profilleme sırasında aynı anda çalışacak thread sayısı
-        'PUNCH_PACKET_COUNT': 300,  # Delme işlemi sırasında her porta gönderilecek paket sayısı
-        'PUNCH_PORT_LIMIT': 2000,  # Analiz edilen aralıktan en fazla kaç porta saldırılacağı
+        'PROFILING_PROBES': 1500,
+        'PROFILING_WORKERS': 250,
         'STUN_HOST': 'stun.l.google.com',
         'STUN_PORT': 19302,
-        'LISTEN_PORT': 5000,
-        'LISTEN_TIMEOUT': 20
+        'ENTROPY_WINDOW_SIZE': 500,
+        'ENTROPY_STEP_SIZE': 50,
     }
-
-    # ---------------------
 
     def __init__(self):
         self.local_ip = self._get_local_ip()
@@ -56,8 +42,8 @@ class SmartNATPuncher:
     def _get_local_ip(self):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
+            s.connect(("8.8.8.8", 80));
+            ip = s.getsockname()[0];
             s.close()
             return ip
         except Exception:
@@ -67,70 +53,48 @@ class SmartNATPuncher:
         try:
             return requests.get('https://api.ipify.org', timeout=5).text
         except Exception:
-            print("⚠️ Public IP 'ipify' üzerinden alınamadı, STUN ile öğrenilecek.")
-            return None  # Profilleme sırasında öğrenilecek
+            print("⚠️ Public IP 'ipify' üzerinden alınamadı, STUN ile öğrenilecek.");
+            return None
 
     def _resolve_stun_host(self):
         try:
             return socket.gethostbyname(self.CONFIG['STUN_HOST'])
         except socket.gaierror:
-            print(
-                f"❌ HATA: STUN sunucusu '{self.CONFIG['STUN_HOST']}' çözümlenemedi. İnternet bağlantınızı kontrol edin.")
+            print(f"❌ HATA: STUN sunucusu '{self.CONFIG['STUN_HOST']}' çözümlenemedi.");
             return None
 
     def _profiling_worker(self, task_queue, results_list, pbar):
-        """Kuyruktan görevleri alır, STUN sorgusunu yapar ve sonucu listeye ekler."""
         while True:
             try:
                 task_queue.get_nowait()
             except Empty:
                 break
-
             try:
-                _, _, assigned_port = stun.get_ip_info(
-                    stun_host=self.stun_server_ip,
-                    stun_port=self.CONFIG['STUN_PORT'],
-                    source_port=0
-                )
-                if assigned_port:
-                    results_list.append(assigned_port)
+                _, _, assigned_port = stun.get_ip_info(stun_host=self.stun_server_ip,
+                                                       stun_port=self.CONFIG['STUN_PORT'], source_port=0)
+                if assigned_port: results_list.append({'port': assigned_port, 'time': time.time()})
             except (stun.StunError, socket.timeout, OSError):
                 pass
             finally:
-                pbar.update(1)
-                task_queue.task_done()
+                pbar.update(1); task_queue.task_done()
 
     def profile_nat_behavior(self):
-        """Adım 1: Yüksek hızda STUN sorguları ile NAT port atama davranışını profiller."""
-        if not self.stun_server_ip:
-            return None
-
+        if not self.stun_server_ip: return None
         print(f"\n🔍 Adım 1: NAT Davranışı Profillemesi Başlatılıyor...")
-        print(f"   {self.CONFIG['PROFILING_PROBES']} sorgu {self.CONFIG['PROFILING_WORKERS']} işçi ile gönderilecek.")
+        task_queue, collected_data = Queue(), []
+        for _ in range(self.CONFIG['PROFILING_PROBES']): task_queue.put(1)
 
-        task_queue = Queue()
-        for _ in range(self.CONFIG['PROFILING_PROBES']):
-            task_queue.put(1)
+        with tqdm(total=self.CONFIG['PROFILING_PROBES'], desc="NAT Profilleniyor", unit="sorgu") as pbar:
+            threads = [threading.Thread(target=self._profiling_worker, args=(task_queue, collected_data, pbar)) for _ in
+                       range(self.CONFIG['PROFILING_WORKERS'])]
+            for t in threads: t.start()
+            task_queue.join()
+            for t in threads: t.join()
 
-        collected_ports = []
-        pbar = tqdm(total=self.CONFIG['PROFILING_PROBES'], desc="NAT Profilleniyor", unit="sorgu")
-
-        threads = []
-        for _ in range(self.CONFIG['PROFILING_WORKERS']):
-            t = threading.Thread(target=self._profiling_worker, args=(task_queue, collected_ports, pbar))
-            t.start()
-            threads.append(t)
-
-        task_queue.join()
-        for t in threads:
-            t.join()
-        pbar.close()
-
-        if not collected_ports:
-            print("❌ Profilleme başarısız. STUN sunucusundan hiç yanıt alınamadı.")
+        if not collected_data:
+            print("❌ Profilleme başarısız.");
             return None
 
-        # Eğer başta public IP alınamadıysa, ilk başarılı yanıttan al
         if not self.public_ip:
             try:
                 _, self.public_ip, _ = stun.get_ip_info(stun_host=self.stun_server_ip,
@@ -138,173 +102,131 @@ class SmartNATPuncher:
             except:
                 self.public_ip = "Bilinmiyor"
 
-        print(f"✅ Profilleme Tamamlandı. {len(collected_ports)} başarılı yanıt toplandı.")
-        return collected_ports
+        print(f"✅ Profilleme Tamamlandı. {len(collected_data)} başarılı yanıt toplandı.")
+        collected_data.sort(key=lambda x: x['time'])
+        return collected_data
 
-    def analyze_port_range(self, port_list):
-        """Adım 2: Toplanan portları analiz ederek min/max aralığını bulur."""
-        print("\n📊 Adım 2: Port Verisi Analiz Ediliyor...")
+    def _calculate_entropy(self, data):
+        # HATA DÜZELTMESİ: NumPy array'inin boş olup olmadığı .size ile kontrol edilir.
+        if data.size == 0: return 0
+        counts = Counter(data)
+        total_items = len(data)
+        return -sum((count / total_items) * math.log2(count / total_items) for count in counts.values())
 
-        min_port = int(np.min(port_list))
-        max_port = int(np.max(port_list))
-        unique_ports = len(set(port_list))
+    def analyze_entropy_density(self, ports, window_size, step_size):
+        min_p, max_p = ports.min(), ports.max()
+        entropy_map = []
 
-        print(f"   -> En Düşük Port: {min_port}")
-        print(f"   -> En Yüksek Port: {max_port}")
-        print(f"   -> Benzersiz Port Sayısı: {unique_ports}")
-        print(f"   -> TESPİT EDİLEN PORT ARALIĞI: [{min_port} - {max_port}]")
+        for start_port in range(min_p, max_p - window_size + 1, step_size):
+            end_port = start_port + window_size
+            ports_in_window = ports[(ports >= start_port) & (ports < end_port)]
 
-        return min_port, max_port
+            # Burada len() kullanmak güvenlidir, ancak .size da kullanılabilir.
+            if len(ports_in_window) > 10:
+                entropy = self._calculate_entropy(ports_in_window)
+                entropy_map.append({
+                    'range': (start_port, end_port),
+                    'entropy': entropy,
+                    'hits': len(ports_in_window)
+                })
 
-    def _mass_burst_worker(self, target_ip, ports_to_punch):
-        """Belirlenen portlara yoğun UDP paketi gönderir."""
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        for _ in range(self.CONFIG['PUNCH_PACKET_COUNT']):
-            for port in ports_to_punch:
-                try:
-                    s.sendto(b'PUNCH', (target_ip, port))
-                except Exception:
-                    pass
-        s.close()
+        entropy_map.sort(key=lambda x: x['entropy'], reverse=True)
+        return entropy_map
 
-    def _listen_for_responses(self, result_queue):
-        """Delme işlemi sırasında hedeften gelebilecek yanıtları dinler."""
-        print(f"   👂 Yanıtlar {self.CONFIG['LISTEN_PORT']} portundan dinleniyor...")
-        responses = []
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(1)
-            sock.bind(('0.0.0.0', self.CONFIG['LISTEN_PORT']))
+    def perform_ultimate_analysis(self, data_points):
+        print("\n" + "=" * 80)
+        print("📊 Adım 2: Nihai NAT Davranış Analizi Raporu")
+        print("=" * 80)
 
-            start_time = time.time()
-            while time.time() - start_time < self.CONFIG['LISTEN_TIMEOUT']:
-                try:
-                    data, addr = sock.recvfrom(1024)
-                    if data:  # Gelen herhangi bir veri başarı sayılır
-                        print(f"   📨 BAŞARILI YANIT GELDİ! -> Adres: {addr}")
-                        responses.append(addr)
-                except socket.timeout:
-                    continue
-            sock.close()
-        except Exception as e:
-            print(f"   ❌ Dinleme hatası: {e}")
+        ports = np.array([dp['port'] for dp in data_points])
 
-        if responses:
-            result_queue.put(list(set(responses)))
+        min_port, max_port = int(ports.min()), int(ports.max())
+        mean_port, std_dev = ports.mean(), ports.std()
+        median_port, q1, q3 = np.percentile(ports, [50, 25, 75])
+        unique_ports_ratio = len(np.unique(ports)) / len(ports)
+        deltas = np.diff(ports)
+        delta_mode_val, _ = mode(deltas) if len(deltas) > 0 else (0, 0)
+        delta_std = deltas.std() if len(deltas) > 0 else 0
 
-    def execute_targeted_punch(self, target_ip, min_port, max_port):
-        """Adım 3: Analiz edilen port aralığına hedefe yönelik delme işlemi uygular."""
-        print("\n💥 Adım 3: Hedefe Yönelik Delme İşlemi Başlatılıyor...")
+        print("\n--- A. Genel İstatistiksel Dağılım ---")
+        print(f"Port Aralığı:             [{min_port} - {max_port}] (Genişlik: {max_port - min_port})")
+        print(f"İstatistiksel Merkez:       Ortalama={int(mean_port)}, Medyan={int(median_port)}")
+        print(f"Yayılım (IQR):            {int(q1)} - {int(q3)}")
+        print(f"Benzersiz Port Oranı:     {unique_ports_ratio:.2%}")
 
-        ports_to_punch = list(range(min_port, max_port + 1))
-        random.shuffle(ports_to_punch)
-        ports_to_punch = ports_to_punch[:self.CONFIG['PUNCH_PORT_LIMIT']]
+        print("\n--- B. Sıralı Davranış Analizi (Desenler) ---")
+        print(
+            f"Adım Farkı (Delta) Modu:  {int(delta_mode_val[0]) if isinstance(delta_mode_val, np.ndarray) else int(delta_mode_val)} (en sık tekrarlanan port artış miktarı)")
+        print(f"Adım Farkı (Delta) Std Sap: {delta_std:.2f} (Düşük değer > Sıralı, Yüksek değer > Rastgele)")
 
-        print(f"   -> Hedef: {target_ip}")
-        print(f"   -> Saldırılacak Port Sayısı: {len(ports_to_punch)}")
-        print(f"   -> Port Başına Paket: {self.CONFIG['PUNCH_PACKET_COUNT']}")
+        print("\n--- C. Yoğun Entropi Bölgeleri (En Rastgele Aralıklar) ---")
+        entropy_map = self.analyze_entropy_density(ports, self.CONFIG['ENTROPY_WINDOW_SIZE'],
+                                                   self.CONFIG['ENTROPY_STEP_SIZE'])
+        if not entropy_map:
+            print("Yeterli veri yoğunluğu bulunamadığı için entropi bölgeleri hesaplanamadı.")
+        else:
+            print(f"Analiz, {self.CONFIG['ENTROPY_WINDOW_SIZE']} port genişliğindeki pencerelerle yapılmıştır.")
+            for i, item in enumerate(entropy_map[:3]):
+                print(
+                    f" #{i + 1} En Yoğun Bölge: Port {item['range'][0]}-{item['range'][1]} | Entropi: {item['entropy']:.4f} bits | {item['hits']} isabet")
+            print(
+                "  -> Yorum: Bu bölgeler, NAT'ınızın en tahmin edilemez ve çeşitli port atamalarını yaptığı 'sıcak noktalardır'.")
 
-        result_queue = Queue()
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(18, 20), gridspec_kw={'height_ratios': [2, 3, 2]})
+        fig.suptitle('Nihai NAT Davranış Analizi Raporu', fontsize=22, y=0.97)
 
-        listen_thread = threading.Thread(target=self._listen_for_responses, args=(result_queue,))
-        burst_thread = threading.Thread(target=self._mass_burst_worker, args=(target_ip, ports_to_punch))
+        ax1.hist(ports, bins=200, density=True, color='skyblue', edgecolor='k', alpha=0.7,
+                 label='Gerçek Port Yoğunluğu (Gauss Analizi)')
+        x_gauss = np.linspace(min_port, max_port, 1000)
+        pdf_gauss = norm.pdf(x_gauss, loc=mean_port, scale=std_dev)
+        ax1.plot(x_gauss, pdf_gauss, 'r--', linewidth=2, label=f'İdeal Gauss Dağılımı')
+        ax1.set_title('Grafik 1 (NE?): Port Atama Dağılımı ve Gauss Karşılaştırması', fontsize=16)
+        ax1.set_xlabel('Port Numarası');
+        ax1.set_ylabel('Yoğunluk');
+        ax1.legend();
+        ax1.grid(True, alpha=0.5)
 
-        listen_thread.start()
-        time.sleep(0.5)  # Dinleyicinin başlaması için kısa bir süre bekle
-        burst_thread.start()
+        ax2.plot(range(len(ports)), ports, marker='o', linestyle='-', markersize=2.5, alpha=0.6, color='green',
+                 label='Port Atama Sırası')
+        ax2.set_title('Grafik 2 (NASIL?): Portların İstek Sırasına Göre Atanma Deseni', fontsize=16)
+        ax2.set_xlabel('İstek Sıra Numarası');
+        ax2.set_ylabel('Atanan Port Numarası');
+        ax2.legend();
+        ax2.grid(True, alpha=0.5)
 
-        burst_thread.join()
-        listen_thread.join()
+        if entropy_map:
+            x_entropy = [item['range'][0] + self.CONFIG['ENTROPY_WINDOW_SIZE'] / 2 for item in entropy_map]
+            y_entropy = [item['entropy'] for item in entropy_map]
+            ax3.plot(x_entropy, y_entropy, marker='.', linestyle='-', color='darkorange', label='Bölgesel Entropi')
+            peak_entropy = entropy_map[0]
+            ax3.axvline(peak_entropy['range'][0] + self.CONFIG['ENTROPY_WINDOW_SIZE'] / 2, color='crimson',
+                        linestyle='--', linewidth=2, label=f"Zirve Entropi: {peak_entropy['entropy']:.2f} bits")
+            ax3.set_title('Grafik 3 (NEREDE?): Port Aralığındaki Rastgelelik (Entropi) Yoğunluğu', fontsize=16)
+            ax3.set_xlabel('Port Aralığı Merkezi');
+            ax3.set_ylabel('Shannon Entropisi (bits)');
+            ax3.legend();
+            ax3.grid(True, alpha=0.5)
 
-        try:
-            return result_queue.get_nowait()
-        except Empty:
-            return None
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        filename = f"ultimate_nat_analysis_{int(time.time())}.png"
+        plt.savefig(filename)
+        print(f"\n-> Nihai analiz raporu grafiği '{filename}' olarak kaydedildi.")
 
     def run(self):
-        """Tüm süreci yöneten ana fonksiyon."""
-        print("=" * 60)
-        print("🚀 Akıllı NAT Delme Aracı Başlatıldı 🚀")
+        print("=" * 80)
+        print("🚀 Nihai NAT Analiz Laboratuvarı Başlatıldı 🚀")
         print(f"Yerel IP: {self.local_ip} | Genel IP: {self.public_ip or 'Bilinmiyor'}")
-        print("=" * 60)
+        print("=" * 80)
 
-        target_input = input("Hedef IP veya Alan Adını Girin: ").strip()
-        try:
-            target_ip = socket.gethostbyname(target_input)
-        except socket.gaierror:
-            print(f"❌ HATA: '{target_input}' adresi çözümlenemedi.")
+        collected_data = self.profile_nat_behavior()
+        if not collected_data:
+            print("\nSüreç sonlandırıldı.");
             return
 
-        # Adım 1: Profilleme
-        collected_ports = self.profile_nat_behavior()
-        if not collected_ports:
-            print("\nSüreç sonlandırıldı.")
-            return
-
-        # Adım 2: Analiz
-        min_port, max_port = self.analyze_port_range(collected_ports)
-
-        # Adım 3: Delme İşlemi
-        results = self.execute_targeted_punch(target_ip, min_port, max_port)
-
-        # Sonuç
-        print("\n" + "=" * 60)
-        print("✨ İŞLEM TAMAMLANDI ✨")
-        if results:
-            print(f"\n🎉🎉🎉 BAŞARILI! 🎉🎉🎉")
-            print("Hedefle doğrudan iletişim kurulabilecek adres(ler) bulundu:")
-            for addr in results:
-                print(f" -> {addr[0]}:{addr[1]}")
-        else:
-            print("\n💥 maalesef yanıt alınamadı. Farklı ayarlarla tekrar deneyin.")
-        print("=" * 60)
+        self.perform_ultimate_analysis(collected_data)
+        print("\nAnaliz tamamlandı.")
 
 
-# --------------------------------------------------------------------------
-# HEDEFIN ÇALIŞTIRMASI GEREKEN BASİT YANITLAYICI (RESPONDER)
-# --------------------------------------------------------------------------
-class SimpleResponder:
-    def __init__(self, port=SmartNATPuncher.CONFIG['LISTEN_PORT']):
-        self.port = port
-        self.running = True
-
-    def start(self):
-        print(f"\n🔊 Basit Yanıtlayıcı (Responder) {self.port} portunda başlatıldı.")
-        print("Diğer taraf delme işlemini başlattığında gelen paketlere yanıt verecek.")
-        print("Durdurmak için CTRL+C tuşlarına basın.")
-
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind(('0.0.0.0', self.port))
-            sock.settimeout(1)
-
-            while self.running:
-                try:
-                    data, addr = sock.recvfrom(1024)
-                    if data:
-                        # Gelen herhangi bir pakete, geldiği adrese yanıt gönder
-                        sock.sendto(b"ACK_RESPONSE", addr)
-                        print(f"   -> {addr} adresinden paket alındı, yanıt gönderildi.")
-                except socket.timeout:
-                    continue
-                except KeyboardInterrupt:
-                    self.running = False
-
-            sock.close()
-            print("\n🛑 Yanıtlayıcı durduruldu.")
-        except Exception as e:
-            print(f"❌ Yanıtlayıcı hatası: {e}")
-
-
-# --- ANA ÇALIŞTIRMA BLOĞU ---
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "responder":
-        # Yanıtlayıcı modunda çalıştır
-        responder = SimpleResponder()
-        responder.start()
-    else:
-        # Ana Delme Aracı modunda çalıştır
-        puncher = SmartNATPuncher()
-        puncher.run()
+    analyzer = UltimateNATAnalyzer()
+    analyzer.run()
